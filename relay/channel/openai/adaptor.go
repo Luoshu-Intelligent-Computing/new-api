@@ -592,7 +592,68 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 	if info != nil && request.Reasoning != nil && request.Reasoning.Effort != "" {
 		info.ReasoningEffort = request.Reasoning.Effort
 	}
+
+	if shouldWrapResponsesStringInputAsList(c, request) {
+		wrappedInput, err := wrapResponsesStringInputAsList(request)
+		if err != nil {
+			return nil, err
+		}
+		request.Input = wrappedInput
+	}
 	return request, nil
+}
+
+func shouldWrapResponsesStringInputAsList(c *gin.Context, request dto.OpenAIResponsesRequest) bool {
+	if common.GetJsonType(request.Input) != "string" {
+		return false
+	}
+	if c == nil || c.Request == nil {
+		return false
+	}
+	originator := strings.TrimSpace(c.Request.Header.Get("Originator"))
+	betaFeatures := strings.TrimSpace(c.Request.Header.Get("X-Codex-Beta-Features"))
+	sessionID := strings.TrimSpace(c.Request.Header.Get("Session_id"))
+	openAIBeta := strings.TrimSpace(c.Request.Header.Get("OpenAI-Beta"))
+	userAgent := strings.ToLower(strings.TrimSpace(c.Request.Header.Get("User-Agent")))
+
+	if originator == "codex_cli_rs" {
+		return true
+	}
+	if betaFeatures != "" || sessionID != "" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(openAIBeta), "responses=experimental") {
+		return true
+	}
+	if strings.Contains(userAgent, "codex") {
+		return true
+	}
+	return false
+}
+
+func wrapResponsesStringInputAsList(request dto.OpenAIResponsesRequest) (json.RawMessage, error) {
+	inputs := request.ParseInput()
+	if len(inputs) == 0 {
+		return request.Input, nil
+	}
+	contentParts := make([]map[string]any, 0, len(inputs))
+	for _, input := range inputs {
+		switch input.Type {
+		case "input_text":
+			contentParts = append(contentParts, map[string]any{"type": "input_text", "text": input.Text})
+		case "input_image":
+			contentParts = append(contentParts, map[string]any{"type": "input_image", "image_url": input.ImageUrl})
+		case "input_file":
+			contentParts = append(contentParts, map[string]any{"type": "input_file", "file_url": input.FileUrl})
+		default:
+			contentParts = append(contentParts, map[string]any{"type": input.Type})
+		}
+	}
+	wrappedInput, err := common.Marshal([]map[string]any{{"role": "user", "content": contentParts}})
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(wrappedInput), nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
