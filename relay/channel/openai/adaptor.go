@@ -589,8 +589,11 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		}
 		request.Model = originModel
 	}
-	if info != nil && request.Reasoning != nil && request.Reasoning.Effort != "" {
-		info.ReasoningEffort = request.Reasoning.Effort
+	if request.Reasoning != nil && request.Reasoning.Effort != "" {
+		request.Reasoning.Effort = normalizeResponsesReasoningEffort(request.Model, request.Reasoning.Effort)
+		if info != nil {
+			info.ReasoningEffort = request.Reasoning.Effort
+		}
 	}
 
 	if shouldWrapResponsesStringInputAsList(c, request) {
@@ -629,6 +632,15 @@ func shouldWrapResponsesStringInputAsList(c *gin.Context, request dto.OpenAIResp
 		return true
 	}
 	return false
+}
+
+func normalizeResponsesReasoningEffort(model string, effort string) string {
+	model = strings.TrimSpace(strings.ToLower(model))
+	effort = strings.TrimSpace(strings.ToLower(effort))
+	if model == "gpt-5.1-codex-mini" && effort == "xhigh" {
+		return "high"
+	}
+	return effort
 }
 
 func wrapResponsesStringInputAsList(request dto.OpenAIResponsesRequest) (json.RawMessage, error) {
