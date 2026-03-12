@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,12 +23,26 @@ import (
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
-	// read response body
 	var responsesResponse dto.OpenAIResponsesResponse
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
+
+	if bodyLooksLikeResponsesSSE(resp, responseBody) {
+		parsedResponse, usage, parseErr := parseResponsesSSEToJSON(responseBody)
+		if parseErr != nil {
+			return nil, types.NewOpenAIError(parseErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
+		responseBytes, marshalErr := common.Marshal(parsedResponse)
+		if marshalErr != nil {
+			return nil, types.NewOpenAIError(marshalErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
+		resp.Header.Set("Content-Type", "application/json")
+		service.IOCopyBytesGracefully(c, resp, responseBytes)
+		return usage, nil
+	}
+
 	err = common.Unmarshal(responseBody, &responsesResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
@@ -40,10 +57,8 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		c.Set("image_generation_call_size", responsesResponse.GetSize())
 	}
 
-	// 写入新的 response body
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
-	// compute usage
 	usage := dto.Usage{}
 	if responsesResponse.Usage != nil {
 		usage.PromptTokens = responsesResponse.Usage.InputTokens
@@ -56,7 +71,6 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if info == nil || info.ResponsesUsageInfo == nil || info.ResponsesUsageInfo.BuiltInTools == nil {
 		return &usage, nil
 	}
-	// 解析 Tools 用量
 	for _, tool := range responsesResponse.Tools {
 		buildToolinfo, ok := info.ResponsesUsageInfo.BuiltInTools[common.Interface2String(tool["type"])]
 		if !ok || buildToolinfo == nil {
@@ -66,6 +80,84 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		buildToolinfo.CallCount++
 	}
 	return &usage, nil
+}
+
+func bodyLooksLikeResponsesSSE(resp *http.Response, body []byte) bool {
+	if resp != nil {
+		contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+		if strings.Contains(contentType, "text/event-stream") {
+			return true
+		}
+	}
+	trimmed := strings.TrimSpace(string(body))
+	return strings.HasPrefix(trimmed, "event:") || strings.HasPrefix(trimmed, "data:")
+}
+
+func parseResponsesSSEToJSON(body []byte) (*dto.OpenAIResponsesResponse, *dto.Usage, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 64<<10), 64<<20)
+	usage := &dto.Usage{}
+	var outputTextBuilder strings.Builder
+	var latestResponse *dto.OpenAIResponsesResponse
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "event:") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var streamResponse dto.ResponsesStreamResponse
+		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+			continue
+		}
+		if streamResponse.Response != nil {
+			latestResponse = streamResponse.Response
+			if streamResponse.Response.Usage != nil {
+				usage.PromptTokens = streamResponse.Response.Usage.InputTokens
+				usage.CompletionTokens = streamResponse.Response.Usage.OutputTokens
+				usage.TotalTokens = streamResponse.Response.Usage.TotalTokens
+				if streamResponse.Response.Usage.InputTokensDetails != nil {
+					usage.PromptTokensDetails.CachedTokens = streamResponse.Response.Usage.InputTokensDetails.CachedTokens
+				}
+			}
+		}
+		if streamResponse.Type == "response.output_text.delta" {
+			outputTextBuilder.WriteString(streamResponse.Delta)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, err
+	}
+	if latestResponse == nil {
+		return nil, nil, fmt.Errorf("failed to parse SSE responses body")
+	}
+	if len(latestResponse.Output) == 0 && outputTextBuilder.Len() > 0 {
+		latestResponse.Output = []dto.ResponsesOutput{{
+			Type:   "message",
+			Role:   "assistant",
+			Status: "completed",
+			Content: []dto.ResponsesOutputContent{{
+				Type: "output_text",
+				Text: outputTextBuilder.String(),
+			}},
+		}}
+	}
+	if latestResponse.Usage == nil {
+		latestResponse.Usage = usage
+	}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+	if len(latestResponse.Status) == 0 {
+		latestResponse.Status = json.RawMessage(`"completed"`)
+	}
+	return latestResponse, usage, nil
 }
 
 func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

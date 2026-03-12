@@ -71,6 +71,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	}
 	adaptor.Init(info)
 	var requestBody io.Reader
+	var convertedRequestAny any
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
@@ -120,10 +121,19 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		httpResp = resp.(*http.Response)
 
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
-			// reset status code 重置状态码
-			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
-			return newAPIError
+			if retryBody, retry := buildResponsesListInputRetryBody(convertedRequestAny, httpResp); retry {
+				service.CloseResponseBodyGracefully(httpResp)
+				retryResp, retryErr := adaptor.DoRequest(c, info, bytes.NewBuffer(retryBody))
+				if retryErr != nil {
+					return types.NewOpenAIError(retryErr, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+				}
+				httpResp = retryResp.(*http.Response)
+			}
+			if httpResp.StatusCode != http.StatusOK {
+				newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+				service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+				return newAPIError
+			}
 		}
 	}
 
@@ -158,4 +168,58 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		postConsumeQuota(c, info, usageDto)
 	}
 	return nil
+}
+
+func buildResponsesListInputRetryBody(convertedRequestAny any, resp *http.Response) ([]byte, bool) {
+	if resp == nil || resp.Body == nil {
+		return nil, false
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false
+	}
+	resp.Body = io.NopCloser(bytes.NewBuffer(body))
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "Input must be a list") {
+		return nil, false
+	}
+	var request dto.OpenAIResponsesRequest
+	switch v := convertedRequestAny.(type) {
+	case dto.OpenAIResponsesRequest:
+		request = v
+	case *dto.OpenAIResponsesRequest:
+		if v == nil {
+			return nil, false
+		}
+		request = *v
+	default:
+		return nil, false
+	}
+	if common.GetJsonType(request.Input) != "string" {
+		return nil, false
+	}
+	inputs := request.ParseInput()
+	if len(inputs) == 0 {
+		return nil, false
+	}
+	contentParts := make([]map[string]any, 0, len(inputs))
+	for _, input := range inputs {
+		switch input.Type {
+		case "input_text":
+			contentParts = append(contentParts, map[string]any{"type": "input_text", "text": input.Text})
+		case "input_image":
+			contentParts = append(contentParts, map[string]any{"type": "input_image", "image_url": input.ImageUrl})
+		case "input_file":
+			contentParts = append(contentParts, map[string]any{"type": "input_file", "file_url": input.FileUrl})
+		}
+	}
+	wrappedInput, err := common.Marshal([]map[string]any{{"role": "user", "content": contentParts}})
+	if err != nil {
+		return nil, false
+	}
+	request.Input = wrappedInput
+	retryBody, err := common.Marshal(request)
+	if err != nil {
+		return nil, false
+	}
+	return retryBody, true
 }
