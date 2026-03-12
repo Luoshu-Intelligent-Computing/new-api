@@ -29,3 +29,11 @@ data/
 .gomodcache/
 .gocache-temp
 .gopath
+
+# ops local files
+ops/backups/*
+!ops/backups/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+*.log

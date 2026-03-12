@@ -1,0 +1,17 @@
+[Unit]
+Description=New API Gateway
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/new-api/data
+EnvironmentFile=/opt/new-api/.env
+ExecStart=/opt/new-api/bin/new-api
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/new-api/log/new-api.log
+StandardError=append:/opt/new-api/log/new-api.log
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
